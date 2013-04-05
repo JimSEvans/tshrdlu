@@ -19,6 +19,9 @@ package tshrdlu.twitter
 import akka.actor._
 import twitter4j._
 import collection.JavaConversions._
+import tshrdlu.util._
+import tshrdlu.project.Polarity
+import sys.process._
 
 /**
  * An object to define the message types that the actors in the bot use for
@@ -31,6 +34,7 @@ object Bot {
   
   object Start
   object Shutdown
+  object CheckWeather
   case class MonitorUserStream(listen: Boolean)
   case class RegisterReplier(replier: ActorRef)
   case class ReplyToStatus(status: Status)
@@ -41,6 +45,13 @@ object Bot {
     val system = ActorSystem("TwitterBot")
     val bot = system.actorOf(Props[Bot], name = "Bot")
     bot ! Start
+
+    // Check the weather every hour
+    while(1==1) {
+      bot ! CheckWeather
+      Thread.sleep(3600000)
+    }
+
   }
 
 }
@@ -61,6 +72,10 @@ with StatusListenerAdaptor with UserStreamListenerAdaptor {
   stream.addListener(this)
   val username = stream.getScreenName
 
+  var mood = 0
+  var posCount = 1
+  var negCount = 1
+
   val twitter = new TwitterFactory().getInstance
   val replierManager = context.actorOf(Props[ReplierManager], name = "ReplierManager")
   val streamReplier = context.actorOf(Props[StreamReplier], name = "StreamReplier")
@@ -75,16 +90,67 @@ with StatusListenerAdaptor with UserStreamListenerAdaptor {
 
   def receive = {
     case Start => stream.user
+  
+    case CheckWeather =>
+      val cmd = "curl http://api.openweathermap.org/data/2.1/find/city?lat=30.267151&lon=-97.743057&cnt=1"
+      val weatherJson = cmd !!
+      //val weatherRE = """.*cod":"([0-9]+).*""".r
+      //val weatherRE(c) = weatherJson
+      val idx = weatherJson.indexOf("""weather":[{"id""")
+      val code = weatherJson.slice(idx+16,idx+19).toInt
+      if(code == 800){
+        mood = 3
+      } else if (code > 802){
+        mood = -1
+      } else if (code < 700){
+        mood = -3;
+      }
+      log.info("Checked Weather - New Mood: "+mood)
 
     case Shutdown => stream.shutdown
 
     case SearchTwitter(query) => 
       val tweets: Seq[Status] = twitter.search(query).getTweets.toSeq
-      sender ! tweets
+      val filteredTweets = filterTweetsByMood(tweets)
+      log.info("Length Of Filtered Tweets: "+filteredTweets.length)
+
+      if (filteredTweets.length == 0) {
+        val tweets2: Seq[Status] = twitter.search(query).getTweets.toSeq
+        val filteredTweets2 = filterTweetsByMood(tweets)
+        if (filteredTweets2.length == 0) {
+          sender ! tweets
+        } else {
+          sender ! filteredTweets2
+        }
+      } else {
+        sender ! filteredTweets
+      }
+
+      
       
     case UpdateStatus(update) => 
       log.info("Posting update: " + update.getStatus)
       twitter.updateStatus(update)
+  }
+
+  def filterTweetsByMood(tweets: Seq[Status]): Seq[Status] = {
+    tweets.filter{ tweet =>
+      val pos = SimpleTokenizer(tweet.getText)
+                      .filter{ word => Polarity.posWords(word.toLowerCase) }
+                      .length 
+      val neg = SimpleTokenizer(tweet.getText)
+                      .filter{ word => Polarity.negWords(word.toLowerCase) }
+                      .length 
+
+      val tweetMood = pos-neg
+      if (mood == 3) {
+        tweetMood > 3
+      } else if (mood == -3) {
+        tweetMood < -3
+      } else {
+        (tweetMood-1 <= mood) && (mood <= tweetMood+1)
+      }
+    }
   }
 
   override def onStatus(status: Status) {
@@ -92,7 +158,24 @@ with StatusListenerAdaptor with UserStreamListenerAdaptor {
     val replyName = status.getInReplyToScreenName
     if (replyName == username) {
       log.info("Replying to: " + status.getText)
+
       replierManager ! ReplyToStatus(status)
+
+      val pos = SimpleTokenizer(status.getText)
+                      .filter{ word => Polarity.posWords(word.toLowerCase) }
+                      .length 
+      val neg = SimpleTokenizer(status.getText)
+                      .filter{ word => Polarity.negWords(word.toLowerCase) }
+                      .length
+      posCount += pos
+      negCount += neg
+
+      log.info("Polarity of Incoming Tweet: "+(pos-neg).toString)
+
+      val moodUpdate = posCount.toDouble / (posCount+negCount)
+      val newMood = Math.round(moodUpdate*7)-4
+      mood = Math.round((newMood + mood)/2)
+      log.info("Current Mood: "+mood)
     }
   }
 
@@ -125,7 +208,7 @@ class ReplierManager extends Actor with ActorLogging {
 
       val futureUpdate = Future.sequence(replyFutures).map { candidates =>
         val numCandidates = candidates.length
-        println("NC: " + numCandidates)
+        log.info("NC: " + numCandidates)
         if (numCandidates > 0)
           candidates(random.nextInt(numCandidates))
         else
@@ -220,7 +303,7 @@ class SynonymReplier extends BaseReplier {
 /**
  * An actor that constructs replies to a given status based on synonyms.
  */
-class SynonymStreamReplier extends StreamReplier {
+class SynonymStreamReplier extends BaseReplier {
   import Bot._
   import tshrdlu.util.SimpleTokenizer
 
@@ -232,17 +315,17 @@ class SynonymStreamReplier extends StreamReplier {
 
   import tshrdlu.util.English._
   import TwitterRegex._
-  override implicit val timeout = Timeout(10000)
+  implicit val timeout = Timeout(10 seconds)
 
 
-  override def getReplies(status: Status, maxLength: Int = 140): Future[Seq[String]] = {
+  def getReplies(status: Status, maxLength: Int = 140): Future[Seq[String]] = {
     log.info("Trying to do synonym search")
     val text = stripLeadMention(status.getText).toLowerCase
 
 // Get two words from the tweet, and get up to 5 synonyms each (including the word itself).
 // Matched tweets must contain one synonym of each of the two words.
 
-    val query:String = SimpleTokenizer(text)
+    var query:String = SimpleTokenizer(text)
       .filter(_.length > 3)
       .filter(_.length < 10)
       .filterNot(_.contains('/'))
@@ -250,14 +333,40 @@ class SynonymStreamReplier extends StreamReplier {
       .filterNot(tshrdlu.util.English.stopwords(_))
       .take(2).toList
       .map(w => synonymize(w, 5))
+      .map(theset=>theset.map(word => "\""+word+"\""))
       .map(x=>x.mkString(" OR ")).map(x=>"("+x+")").mkString(" AND ")
 
     log.info("searched for: " + query)
 
+    if (query == "") query = "Texas"
     val futureStatuses = (context.parent ? SearchTwitter(new Query(query))).mapTo[Seq[Status]]
 
-    futureStatuses.map(_.flatMap(getText).filter(_.length <= maxLength))
+    var zero = false
+    futureStatuses.foreach{x=> 
+      log.info(x.length.toString)
+      if (x.length == 0) zero = true
+    }
+
+    if (zero) {
+      Future(Seq("Hmmmm..."))
+    } else {
+      futureStatuses.map(_.flatMap(getText).map(x => x.slice(0,120)))
+    }
+    
  }
+
+ def getText(status: Status): Option[String] = {
+    import tshrdlu.util.English.{isEnglish,isSafe}
+
+    val text = status.getText match {
+      case StripMentionsRE(rest) => rest
+      case x => x
+    }
+    
+    if (!text.contains('@') && !text.contains('/') && isEnglish(text) && isSafe(text))
+      Some(text)
+    else None
+  }
 
 }
 
