@@ -35,6 +35,7 @@ object Bot {
   object Start
   object Shutdown
   object CheckWeather
+  case class SetWeather(code: Int)
   case class MonitorUserStream(listen: Boolean)
   case class RegisterReplier(replier: ActorRef)
   case class ReplyToStatus(status: Status)
@@ -73,6 +74,7 @@ with StatusListenerAdaptor with UserStreamListenerAdaptor {
   val username = stream.getScreenName
 
   var mood = 0
+  var weatherCode = -1
   var posCount = 1
   var negCount = 1
 
@@ -81,11 +83,13 @@ with StatusListenerAdaptor with UserStreamListenerAdaptor {
   val streamReplier = context.actorOf(Props[StreamReplier], name = "StreamReplier")
   val synonymReplier = context.actorOf(Props[SynonymReplier], name = "SynonymReplier")
   val synonymStreamReplier = context.actorOf(Props[SynonymStreamReplier], name = "SynonymStreamReplier")
+  val weatherReplier = context.actorOf(Props[WeatherReplier], name = "WeatherReplier")
 
   override def preStart {
     replierManager ! RegisterReplier(streamReplier)
     replierManager ! RegisterReplier(synonymReplier)
     replierManager ! RegisterReplier(synonymStreamReplier)
+    replierManager ! RegisterReplier(weatherReplier)
   }
 
   def receive = {
@@ -96,6 +100,7 @@ with StatusListenerAdaptor with UserStreamListenerAdaptor {
       val weatherJson = cmd !!
       val idx = weatherJson.indexOf("""weather":[{"id""")
       val code = weatherJson.slice(idx+16,idx+19).toInt
+      weatherCode = code
       if(code == 800){
         mood = 3
       } else if (code > 802){
@@ -103,6 +108,7 @@ with StatusListenerAdaptor with UserStreamListenerAdaptor {
       } else if (code < 700){
         mood = -3;
       }
+      replierManager ! SetWeather(code)
       log.info("Checked Weather - New Mood: "+mood)
 
     case Shutdown => stream.shutdown
@@ -199,10 +205,17 @@ class ReplierManager extends Actor with ActorLogging {
     case RegisterReplier(replier) => 
       repliers = repliers :+ replier
 
+    case SetWeather(code) =>
+      repliers.foreach(w => w ! SetWeather(code))
+
     case ReplyToStatus(status) =>
 
-      val replyFutures: Seq[Future[StatusUpdate]] = 
-        repliers.map(r => (r ? ReplyToStatus(status)).mapTo[StatusUpdate])
+      val replyFutures: Seq[Future[StatusUpdate]] = if (status.getText.contains("weather")) {
+        repliers.filter(r=> r.isInstanceOf[WeatherReplier]).map(r => (r ? ReplyToStatus(status)).mapTo[StatusUpdate])
+      } else {
+        repliers.filter(r=> !r.isInstanceOf[WeatherReplier]).map(r => (r ? ReplyToStatus(status)).mapTo[StatusUpdate])
+      }
+
 
       val futureUpdate = Future.sequence(replyFutures).map { candidates =>
         val numCandidates = candidates.length
@@ -214,7 +227,6 @@ class ReplierManager extends Actor with ActorLogging {
       }
 
       futureUpdate.foreach(context.parent ! UpdateStatus(_))
-    
   }
 
   lazy val fillerStatusMessages = Vector(
@@ -298,6 +310,74 @@ class SynonymReplier extends BaseReplier {
 
 }
 
+class WeatherReplier extends BaseReplier {
+  import Bot._
+  import tshrdlu.util.SimpleTokenizer
+
+  import context.dispatcher
+  import akka.pattern.ask
+  import akka.util._
+  import scala.concurrent.duration._
+  import scala.concurrent.Future
+
+  import tshrdlu.util.English._
+  import TwitterRegex._
+  implicit val timeout = Timeout(10 seconds)
+  var weatherCode = -1
+
+  def getReplies(status: Status, maxLength: Int = 140): Future[Seq[String]] = {
+    log.info("Trying to do weather related search")
+
+    val query = if (weatherCode / 100 == 2) {
+      "(storm OR thunder OR lightning)"
+    } else if (weatherCode / 100 == 3) {
+      "drizzle"
+    } else if (weatherCode / 100 == 5) {
+      "rain"
+    } else if (weatherCode / 100 == 6) {
+      "(snow OR sleet)"
+    } else if (weatherCode / 100 == 7) {
+      "(mist OR fog OR haze)"
+    } else if (weatherCode / 100 == 8) {
+      if (weatherCode < 802) {
+        """(sunny OR "clear sky" OR "beautiful out")"""
+      } else {
+        "(cloudy OR overcast)"
+      }
+    } else {
+      "weather"
+    }
+    val statusesFuture = (context.parent ? SearchTwitter(new Query(query))).mapTo[Seq[Status]]
+
+    statusesFuture.map(_.flatMap(getText).filter(_.length <= maxLength))
+  }
+
+  def receive = {
+    case ReplyToStatus(status) => 
+      val replyName = status.getUser.getScreenName
+      val candidatesFuture = getReplies(status, 138-replyName.length)
+      candidatesFuture.map { candidates =>
+        val reply = "@" + replyName + " " + candidates.toSet.head
+        log.info("Candidate reply: " + reply)
+        new StatusUpdate(reply).inReplyToStatusId(status.getId)
+      } pipeTo sender
+  }
+
+  def getText(status: Status): Option[String] = {
+    import tshrdlu.util.English.{isEnglish,isSafe}
+
+    val text = status.getText match {
+      case StripMentionsRE(rest) => rest
+      case x => x
+    }
+    
+    if (!text.contains('@') && !text.contains('/') && isEnglish(text) && isSafe(text))
+      Some(text)
+    else None
+  }
+
+}
+
 /**
  * An actor that constructs replies to a given status based on synonyms.
  */
@@ -348,7 +428,7 @@ class SynonymStreamReplier extends BaseReplier {
     if (zero) {
       Future(Seq("Hmmmm..."))
     } else {
-      futureStatuses.map(_.flatMap(getText).map(x => x.slice(0,120)))
+      statusesFuture.map(_.flatMap(getText).filter(_.length <= maxLength))
     }
     
  }
