@@ -94,8 +94,6 @@ with StatusListenerAdaptor with UserStreamListenerAdaptor {
     case CheckWeather =>
       val cmd = "curl http://api.openweathermap.org/data/2.1/find/city?lat=30.267151&lon=-97.743057&cnt=1"
       val weatherJson = cmd !!
-      //val weatherRE = """.*cod":"([0-9]+).*""".r
-      //val weatherRE(c) = weatherJson
       val idx = weatherJson.indexOf("""weather":[{"id""")
       val code = weatherJson.slice(idx+16,idx+19).toInt
       if(code == 800){
@@ -114,19 +112,19 @@ with StatusListenerAdaptor with UserStreamListenerAdaptor {
       val filteredTweets = filterTweetsByMood(tweets)
       log.info("Length Of Filtered Tweets: "+filteredTweets.length)
 
-      if (filteredTweets.length == 0) {
+      if (filteredTweets.length < 5) {
+        log.info("Getting More Tweets...")
         val tweets2: Seq[Status] = twitter.search(query).getTweets.toSeq
         val filteredTweets2 = filterTweetsByMood(tweets)
-        if (filteredTweets2.length == 0) {
+
+        val totalTweets = filteredTweets ++ filteredTweets2
+        if (totalTweets.length == 0) {
+          log.info("No tweets with correct mood, defaulting to original")
           sender ! tweets
         } else {
-          sender ! filteredTweets2
+          sender ! totalTweets
         }
-      } else {
-        sender ! filteredTweets
       }
-
-      
       
     case UpdateStatus(update) => 
       log.info("Posting update: " + update.getStatus)
@@ -174,7 +172,7 @@ with StatusListenerAdaptor with UserStreamListenerAdaptor {
 
       val moodUpdate = posCount.toDouble / (posCount+negCount)
       val newMood = Math.round(moodUpdate*7)-4
-      mood = Math.round((newMood + mood)/2)
+      mood = Math.round((newMood + (2*mood))/2)
       log.info("Current Mood: "+mood)
     }
   }
